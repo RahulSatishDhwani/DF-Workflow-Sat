@@ -23,6 +23,7 @@ from report_engine import (
     build_review_table,
     aggregate_workflow,
     write_workflow_excel,
+    reviewer_summary,
     list_saved_programs,
     save_program,
     load_program,
@@ -144,7 +145,8 @@ if st.session_state.review_df is not None:
             st.session_state.review_df, st.session_state.config
         )
         excel_bytes = write_workflow_excel(
-            ngo_list, categories, params_per_category, table, st.session_state.config
+            ngo_list, categories, params_per_category, table, st.session_state.config,
+            reviewer_summary_rows=reviewer_summary(st.session_state.review_df, st.session_state.config),
         )
         st.download_button(
             "Download final .xlsx",
