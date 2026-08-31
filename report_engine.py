@@ -239,9 +239,12 @@ def classify_row(answer: Optional[str], feedback: Optional[str], config: Program
     these as editable columns because real accept/reject calls require
     reading the evidence document and cannot be inferred from text alone.
 
-    Reviewed = any reviewer left a comment at all (regardless of who).
-    Accepted = the comment(s) contain acceptance language (okay, accepted,
-    approved, ...). Reviewed-but-not-accepted = Rejected.
+    Reviewed = at least one comment came from someone in config.im_names or
+    config.trainer_names. A comment from anyone NOT on either list does not
+    count as reviewed — the row stays Accepted=0, Rejected=0 even if a
+    comment is present.
+    Accepted = the IM/Trainer comment(s) contain acceptance language (okay,
+    accepted, approved, ...). Reviewed-but-not-accepted = Rejected.
 
     `answer` (the NGO's own Yes/No self-report) is accepted for call-site
     compatibility but is no longer used to guess Accepted/Rejected.
@@ -254,24 +257,41 @@ def classify_row(answer: Optional[str], feedback: Optional[str], config: Program
     reviewer_names = [name for name, _ in comments]
     reviewed_by_im = any(name.strip().lower() in im_set for name in reviewer_names)
     reviewed_by_trainer = any(name.strip().lower() in trainer_set for name in reviewer_names)
-    has_feedback = len(comments) > 0
+
+    # Only comments from a configured IM or Trainer count toward the
+    # reviewed/accepted/rejected guess. A comment from someone not on either
+    # list (e.g. a typo'd name, or someone outside the program) is ignored
+    # for this purpose.
+    official_comments = [
+        (name, comment)
+        for name, comment in comments
+        if name.strip().lower() in im_set or name.strip().lower() in trainer_set
+    ]
+    has_feedback = len(official_comments) > 0
 
     if not has_feedback:
-        # No reviewer comment at all -> not yet reviewed, so no accept/reject
+        # No comment from a configured IM/Trainer -> not yet reviewed, so no
         # guess is made.
         accepted, rejected = 0, 0
     else:
-        # Any comment from any reviewer counts as "reviewed". Default guess:
-        # acceptance-style language (okay, accepted, approved, ...) -> accepted;
-        # any other comment -> rejected. Edit in the review table if the
-        # reviewer's actual decision differed.
-        combined_comment_text = " ".join(comment for _, comment in comments)
+        # Any comment from a configured IM/Trainer counts as "reviewed".
+        # Default guess: acceptance-style language (okay, accepted,
+        # approved, ...) -> accepted; any other comment -> rejected. Edit in
+        # the review table if the reviewer's actual decision differed.
+        combined_comment_text = " ".join(comment for _, comment in official_comments)
         is_accepted = _is_acceptance_comment(combined_comment_text)
         accepted = 1 if is_accepted else 0
         rejected = 0 if is_accepted else 1
 
+    official_names_seen = []
+    for name, _ in official_comments:
+        canon = name.strip()
+        if canon not in official_names_seen:
+            official_names_seen.append(canon)
+
     return {
         "Reviewer(s)": ", ".join(reviewer_names) if reviewer_names else "",
+        "Official Reviewers": ", ".join(official_names_seen) if official_names_seen else "",
         "Reviewed by IM": int(reviewed_by_im),
         "Reviewed by Trainer": int(reviewed_by_trainer),
         "Accepted": accepted,
@@ -341,6 +361,40 @@ def aggregate_workflow(review_df: pd.DataFrame, config: ProgramConfig):
     return ngo_list, categories, params_per_category, table
 
 
+def reviewer_summary(review_df: pd.DataFrame, config: ProgramConfig):
+    """Count how many docs (rows) each configured IM/Trainer actually
+    reviewed — i.e. left a comment on, counted once per row even if they
+    commented multiple times on the same row.
+
+    Returns a list of dicts: [{"Name": ..., "Role": "IM"/"Trainer",
+    "Docs Reviewed": int}, ...], one row per name in config.im_names /
+    config.trainer_names, in that order. Names with 0 reviews are still
+    included, so you can spot an IM/Trainer who hasn't reviewed anything yet.
+    """
+    counts = {name.strip(): 0 for name in config.im_names + config.trainer_names}
+    im_lookup = {n.strip().lower(): n.strip() for n in config.im_names}
+    trainer_lookup = {n.strip().lower(): n.strip() for n in config.trainer_names}
+
+    for reviewers_str in review_df.get("Official Reviewers", pd.Series(dtype=str)).dropna():
+        if not reviewers_str:
+            continue
+        for name in reviewers_str.split(", "):
+            name = name.strip()
+            if not name:
+                continue
+            key = name.lower()
+            canon = im_lookup.get(key) or trainer_lookup.get(key)
+            if canon:
+                counts[canon] = counts.get(canon, 0) + 1
+
+    rows = []
+    for name in config.im_names:
+        rows.append({"Name": name.strip(), "Role": "IM", "Docs Reviewed": counts.get(name.strip(), 0)})
+    for name in config.trainer_names:
+        rows.append({"Name": name.strip(), "Role": "Trainer", "Docs Reviewed": counts.get(name.strip(), 0)})
+    return rows
+
+
 # --------------------------------------------------------------------------
 # 5. Excel writer — replicates the workflow-sheet layout
 # --------------------------------------------------------------------------
@@ -358,6 +412,7 @@ def write_workflow_excel(
     params_per_category,
     table,
     config: ProgramConfig,
+    reviewer_summary_rows=None,
 ) -> bytes:
     wb = Workbook()
     ws = wb.active
@@ -518,6 +573,23 @@ def write_workflow_excel(
     ws.column_dimensions[get_column_letter(ngo_col)].width = 38
     for c in range(ngo_col + 1, total_start_col + len(total_headers)):
         ws.column_dimensions[get_column_letter(c)].width = 14
+
+    # --- Reviewer Summary sheet: # of docs reviewed per individual IM/Trainer ---
+    if reviewer_summary_rows:
+        ws2 = wb.create_sheet("Reviewer Summary")
+        headers = ["Name", "Role", "Docs Reviewed"]
+        for j, h in enumerate(headers, start=1):
+            c = ws2.cell(row=1, column=j, value=h)
+            c.font = BOLD
+            c.fill = HEADER_FILL
+            c.alignment = CENTER
+        for i, row in enumerate(reviewer_summary_rows, start=2):
+            ws2.cell(row=i, column=1, value=row["Name"])
+            ws2.cell(row=i, column=2, value=row["Role"])
+            ws2.cell(row=i, column=3, value=row["Docs Reviewed"])
+        ws2.column_dimensions["A"].width = 24
+        ws2.column_dimensions["B"].width = 12
+        ws2.column_dimensions["C"].width = 16
 
     out = io.BytesIO()
     wb.save(out)
